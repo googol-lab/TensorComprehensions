@@ -512,7 +512,8 @@ void promoteToSharedGreedy(
           continue;
         }
 
-        scop.promoteGroupToShared(
+        scop.promoteGroup(
+            Scop::PromotedDecl::Kind::SharedMem,
             tensorId,
             std::move(group),
             bandNode,
