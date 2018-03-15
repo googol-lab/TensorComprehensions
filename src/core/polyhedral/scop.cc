@@ -233,6 +233,90 @@ void Scop::promoteGroup(
       std::make_pair(activePoints, PromotionInfo{group, schedule, groupId}));
 }
 
+namespace {
+inline bool rangeOfUMapContainsTupleId(isl::union_map umap, isl::id id) {
+  for (auto s : isl::UnionAsVector<isl::union_set>(umap.range())) {
+    if (s.get_tuple_id() == id) {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline isl::union_map dropMapsWithRangeTupleId(
+    isl::union_map umap,
+    isl::id id) {
+  isl::union_map result = isl::union_map::empty(umap.get_space());
+  for (auto m : isl::UnionAsVector<isl::union_map>(umap)) {
+    if (!m.can_uncurry()) {
+      result = result.add_map(m);
+      continue;
+    }
+    if (m.uncurry().get_tuple_id(isl::dim_type::out) != id) {
+      result = result.add_map(m);
+    }
+  }
+  return result;
+}
+} // namespace
+
+void Scop::demoteGroup(isl::id groupId) {
+  using namespace polyhedral::detail;
+
+  auto extensions = match(
+      extension(
+          [groupId](isl::union_map m) {
+            return rangeOfUMapContainsTupleId(m.range().unwrap(), groupId);
+          },
+          sequence(any())),
+      scheduleRoot());
+
+  CHECK_EQ(extensions.size(), 1)
+      << "group " << groupId << " is not present as schedule extension.";
+
+  auto extensionTree = const_cast<ScheduleTree*>(extensions[0]);
+
+  auto sequenceTree = extensionTree->child({0});
+  for (size_t i = sequenceTree->numChildren(); i > 0; --i) {
+    auto filterElem =
+        sequenceTree->child({i - 1})->elemAs<ScheduleTreeElemFilter>();
+    CHECK(filterElem) << "expected children of a sequence node to be filters "
+                      << "got\n"
+                      << *sequenceTree;
+    if (!rangeOfUMapContainsTupleId(filterElem->filter_.unwrap(), groupId)) {
+      continue;
+    }
+    CHECK_EQ(filterElem->filter_.n_set(), 1)
+        << "filter for copy code contains more than one statement";
+    sequenceTree->detachChild({i - 1});
+  }
+
+  auto extensionElem = extensionTree->elemAs<ScheduleTreeElemExtension>();
+  extensionElem->extension_ =
+      dropMapsWithRangeTupleId(extensionElem->extension_, groupId);
+
+  if (extensionElem->extension_.is_empty()) {
+    auto parent = extensionTree->ancestor(scheduleRoot(), 1);
+    auto pos = extensionTree->positionInParent(parent);
+    if (sequenceTree->numChildren() > 1) {
+      auto ownedSequenceTree = extensionTree->detachChildren();
+      parent->detachChild(pos);
+      parent->insertChildren(pos, std::move(ownedSequenceTree));
+    } else {
+      auto ownedChildren = sequenceTree->detachChildren();
+      parent->detachChild(pos);
+      parent->insertChildren(pos, std::move(ownedChildren));
+    }
+  }
+
+  for (size_t i = activePromotions_.size(); i > 0; --i) {
+    if (activePromotions_[i - 1].second.groupId == groupId) {
+      activePromotions_.erase(activePromotions_.begin() + (i - 1));
+    }
+  }
+  promotedDecls_.erase(groupId);
+}
+
 void Scop::insertSyncsAroundCopies(ScheduleTree* tree) {
   // Return immediately if nothing was inserted
   auto extensionNode =
